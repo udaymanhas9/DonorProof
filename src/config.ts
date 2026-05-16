@@ -23,12 +23,35 @@ export const LOCAL_CONFIG: NetworkConfig = {
   faucet: '',
 };
 
+export const PREPROD_CONFIG: NetworkConfig = {
+  networkId: 'preprod',
+  indexer: 'https://indexer.preprod.midnight.network/api/v3/graphql',
+  indexerWS: 'wss://indexer.preprod.midnight.network/api/v3/graphql/ws',
+  node: 'https://rpc.preprod.midnight.network',
+  nodeWS: 'wss://rpc.preprod.midnight.network',
+  proofServer: process.env['MIDNIGHT_PROOF_SERVER'] ?? 'http://127.0.0.1:6301',
+  faucet: 'https://faucet.preprod.midnight.network/api/request-tokens',
+};
+
+export const PREVIEW_CONFIG: NetworkConfig = {
+  networkId: 'preview',
+  indexer: 'https://indexer.preview.midnight.network/api/v3/graphql',
+  indexerWS: 'wss://indexer.preview.midnight.network/api/v3/graphql/ws',
+  node: 'https://rpc.preview.midnight.network',
+  nodeWS: 'wss://rpc.preview.midnight.network',
+  proofServer: process.env['MIDNIGHT_PROOF_SERVER'] ?? 'http://127.0.0.1:6301',
+  faucet: 'https://faucet.preview.midnight.network/api/request-tokens',
+};
+
 export function getConfig(): NetworkConfig {
   const network = process.env['MIDNIGHT_NETWORK'] ?? 'local';
-  if (network !== 'local') {
-    throw new Error(
-      `Unknown network: ${network}. This harness only supports 'local'.`,
-    );
+  switch (network) {
+    case 'local': return LOCAL_CONFIG;
+    case 'preprod': return PREPROD_CONFIG;
+    case 'preview': return PREVIEW_CONFIG;
+    default:
+      throw new Error(
+        `Unknown network: "${network}". Set MIDNIGHT_NETWORK to local, preprod, or preview.`,
+      );
   }
-  return LOCAL_CONFIG;
 }

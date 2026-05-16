@@ -38,9 +38,9 @@ export class StandaloneConfig implements Config {
   getEnvironment(logger: Logger): TestEnvironment {
     return getTestEnvironment(logger) as TestEnvironment;
   }
-  privateStateStoreName = 'bboard-private-state';
+  privateStateStoreName = 'donor-proof-private-state';
   logDir = path.resolve(currentDir, '..', 'logs', 'standalone', `${new Date().toISOString()}.log`);
-  zkConfigPath = path.resolve(currentDir, '..', '..', 'contract', 'src', 'managed', 'bboard');
+  zkConfigPath = path.resolve(currentDir, '..', '..', 'contract', 'src', 'managed', 'donor-proof');
   requestFaucetTokens = false;
   generateDust = false;
 }
@@ -50,9 +50,9 @@ export class PreviewRemoteConfig implements Config {
     setNetworkId('preview');
     return new PreviewTestEnvironment(logger);
   }
-  privateStateStoreName = 'bboard-private-state';
+  privateStateStoreName = 'donor-proof-private-state';
   logDir = path.resolve(currentDir, '..', 'logs', 'preview-remote', `${new Date().toISOString()}.log`);
-  zkConfigPath = path.resolve(currentDir, '..', '..', 'contract', 'src', 'managed', 'bboard');
+  zkConfigPath = path.resolve(currentDir, '..', '..', 'contract', 'src', 'managed', 'donor-proof');
   requestFaucetTokens = false; // Faucet not available via API, gives 500 error
   generateDust = true;
 }
@@ -62,9 +62,9 @@ export class PreprodRemoteConfig implements Config {
     setNetworkId('preprod');
     return new PreprodTestEnvironment(logger);
   }
-  privateStateStoreName = 'bboard-private-state';
+  privateStateStoreName = 'donor-proof-private-state';
   logDir = path.resolve(currentDir, '..', 'logs', 'preprod-remote', `${new Date().toISOString()}.log`);
-  zkConfigPath = path.resolve(currentDir, '..', '..', 'contract', 'src', 'managed', 'bboard');
+  zkConfigPath = path.resolve(currentDir, '..', '..', 'contract', 'src', 'managed', 'donor-proof');
   requestFaucetTokens = false; // Faucet not available via API, gives 500 error
   generateDust = true;
 }

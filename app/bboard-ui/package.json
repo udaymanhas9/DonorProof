@@ -12,6 +12,8 @@
     "build:start:preview": "npm run build:preview && npm run start",
     "ci": "npm run typecheck && npm run lint",
     "dev": "vite",
+    "dev:preprod": "vite --mode preprod",
+    "dev:preview": "vite --mode preview",
     "lint": "eslint ./src",
     "start": "http-server --port 0 ./dist",
     "typecheck": "tsc -p tsconfig.json --noEmit",
