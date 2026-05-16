@@ -79,6 +79,8 @@ export const useDonorProof = (): DonorProofContextValue => {
 };
 
 // ── Registry helpers ─────────────────────────────────────────────────────────
+// Registry persists the charity list in localStorage across sessions.
+// Mock addresses (prefix "mock:") are seeded on first load and never persisted.
 
 const getRegistry = (): CharityInfo[] => {
   try {
@@ -99,23 +101,6 @@ const seedMockCharities = (): void => {
   saveRegistry(infos);
 };
 
-// ── Mock API factory ─────────────────────────────────────────────────────────
-
-function makeMockApi(
-  charity: MockCharity,
-  getState: () => DonorProofState,
-): DeployedDonorProofAPI {
-  const subject = new BehaviorSubject<DonorProofState>(getState());
-  return {
-    contractAddress: charity.contractAddress,
-    state$: subject.asObservable(),
-    commitExpense: async () => {},
-    verifyCompliance: async () => {},
-    donorDeposit: async () => {},
-    releaseFunds: async () => {},
-  };
-}
-
 // ── Wallet helpers ───────────────────────────────────────────────────────────
 
 const getFirstCompatibleWallet = (): InitialAPI | undefined => {
@@ -127,6 +112,7 @@ const getFirstCompatibleWallet = (): InitialAPI | undefined => {
   );
 };
 
+// Polls window.midnight every 100ms for up to 5s; throws if extension is absent.
 const connectToWallet = (logger: Logger, networkId: string): Promise<ConnectedAPI> =>
   firstValueFrom(
     fnPipe(
@@ -147,6 +133,8 @@ const connectToWallet = (logger: Logger, networkId: string): Promise<ConnectedAP
     ),
   );
 
+// Assembles all Midnight SDK providers from the connected Lace wallet.
+// Called once per session; the resulting providers object is stored in a ref.
 const buildProviders = async (logger: Logger, networkId: string) => {
   const connectedAPI = await connectToWallet(logger, networkId);
   const zkConfigPath = window.location.origin;
@@ -182,8 +170,9 @@ const buildProviders = async (logger: Logger, networkId: string) => {
   };
 };
 
-// ── Commitment hash ───────────────────────────────────────────────────────────
-
+// ── Demo helpers ──────────────────────────────────────────────────────────────
+// Non-cryptographic hash for demo commitment display only.
+// Do NOT surface these values as real Midnight transaction hashes.
 const fakeCommitmentHash = (amount: bigint, category: string, idx: number): string => {
   const raw = `${amount}-${category}-${idx}-${Date.now()}`;
   let h = 0;
@@ -215,7 +204,25 @@ export const DonorProofProvider: React.FC<React.PropsWithChildren<{ logger: Logg
   const providersRef = useRef<Awaited<ReturnType<typeof buildProviders>> | null>(null);
   const mockStateRef = useRef<DonorProofState | null>(null);
   const expenseCountRef = useRef(0);
+  // Counter so concurrent operations don't prematurely clear the pending flag.
+  const pendingCountRef = useRef(0);
+  // All live state$ subscriptions; unsubscribed when the wallet disconnects.
+  const subsRef = useRef<{ unsubscribe(): void }[]>([]);
   const networkId = (import.meta.env.VITE_NETWORK_ID as NetworkId) ?? 'undeployed';
+
+  const beginTx = () => {
+    pendingCountRef.current += 1;
+    setTxPending(true);
+  };
+  const endTx = () => {
+    pendingCountRef.current = Math.max(0, pendingCountRef.current - 1);
+    if (pendingCountRef.current === 0) setTxPending(false);
+  };
+
+  const clearSubscriptions = () => {
+    subsRef.current.forEach(s => s.unsubscribe());
+    subsRef.current = [];
+  };
 
   // ── Demo login ─────────────────────────────────────────────────────────────
 
@@ -231,6 +238,7 @@ export const DonorProofProvider: React.FC<React.PropsWithChildren<{ logger: Logg
     const demoCharity = MOCK_CHARITIES.find(c => c.contractAddress === DEMO_CHARITY_CONTRACT)!;
     mockStateRef.current = { ...demoCharity.state };
 
+    // No-op API: demo state is managed directly via setCurrentCharity in each action.
     const mockApi: DeployedDonorProofAPI = {
       contractAddress: demoCharity.contractAddress,
       state$: new BehaviorSubject<DonorProofState>(mockStateRef.current).asObservable(),
@@ -254,6 +262,7 @@ export const DonorProofProvider: React.FC<React.PropsWithChildren<{ logger: Logg
   }, []);
 
   // ── Real wallet login ──────────────────────────────────────────────────────
+  // Scans the registered charity list to auto-detect if the connecting wallet owns a campaign.
 
   const connectWallet = useCallback(async () => {
     setWalletStatus('connecting');
@@ -264,6 +273,7 @@ export const DonorProofProvider: React.FC<React.PropsWithChildren<{ logger: Logg
       setWalletAddress(built.coinPublicKey);
       setWalletStatus('connected');
       setIsDemoMode(false);
+      clearSubscriptions();
 
       const registry = getRegistry();
       for (const info of registry) {
@@ -273,7 +283,10 @@ export const DonorProofProvider: React.FC<React.PropsWithChildren<{ logger: Logg
           const snapshot = await firstValueFrom(api.state$);
           if (snapshot.campaignOwner === built.coinPublicKey.slice(0, 64)) {
             const deployment: CharityDeployment = { info, api, state: snapshot };
-            api.state$.subscribe((s) => setCurrentCharity((prev) => prev ? { ...prev, state: s } : null));
+            // Track subscription so it can be cleaned up on disconnect.
+            subsRef.current.push(
+              api.state$.subscribe((s) => setCurrentCharity((prev) => prev ? { ...prev, state: s } : null)),
+            );
             setCurrentCharity(deployment);
             setIsCharityOwner(true);
             break;
@@ -298,7 +311,7 @@ export const DonorProofProvider: React.FC<React.PropsWithChildren<{ logger: Logg
     maxAdmin: number,
   ) => {
     if (!providersRef.current) throw new Error('Wallet not connected');
-    setTxPending(true);
+    beginTx();
     setError(null);
     try {
       const api = await DonorProofAPI.deploy(providersRef.current.providers as any, minDirectAid, maxAdmin, logger);
@@ -308,16 +321,18 @@ export const DonorProofProvider: React.FC<React.PropsWithChildren<{ logger: Logg
       setCharities(updated);
       const snapshot = await firstValueFrom(api.state$);
       const deployment: CharityDeployment = { info: charityInfo, api, state: snapshot };
-      api.state$.subscribe((s) => setCurrentCharity((prev) => prev ? { ...prev, state: s } : null));
+      // Track subscription so it can be cleaned up on disconnect.
+      subsRef.current.push(
+        api.state$.subscribe((s) => setCurrentCharity((prev) => prev ? { ...prev, state: s } : null)),
+      );
       setCurrentCharity(deployment);
       setIsCharityOwner(true);
     } finally {
-      setTxPending(false);
+      endTx();
     }
   }, [logger]);
 
   const joinCharity = useCallback(async (address: string): Promise<DeployedDonorProofAPI> => {
-    // Mock addresses: return a live BehaviorSubject API
     if (address.startsWith('mock:')) {
       const mock = MOCK_CHARITIES.find(c => c.contractAddress === address);
       if (!mock) throw new Error('Mock charity not found');
@@ -337,7 +352,7 @@ export const DonorProofProvider: React.FC<React.PropsWithChildren<{ logger: Logg
 
   const commitExpense = useCallback(async (amount: bigint, isDirectAid: boolean, isAdmin: boolean, category: string) => {
     if (!currentCharity) throw new Error('No charity selected');
-    setTxPending(true);
+    beginTx();
     setError(null);
     try {
       if (isDemoMode) {
@@ -380,13 +395,13 @@ export const DonorProofProvider: React.FC<React.PropsWithChildren<{ logger: Logg
       setError(err instanceof Error ? err.message : 'Transaction failed');
       throw err;
     } finally {
-      setTxPending(false);
+      endTx();
     }
   }, [currentCharity, isDemoMode]);
 
   const verifyCompliance = useCallback(async () => {
     if (!currentCharity) throw new Error('No charity selected');
-    setTxPending(true);
+    beginTx();
     setError(null);
     try {
       if (isDemoMode) {
@@ -412,17 +427,16 @@ export const DonorProofProvider: React.FC<React.PropsWithChildren<{ logger: Logg
       setError(err instanceof Error ? err.message : 'Proof generation failed');
       throw err;
     } finally {
-      setTxPending(false);
+      endTx();
     }
   }, [currentCharity, isDemoMode]);
 
   const donorDeposit = useCallback(async (contractAddress: string, amount: bigint, restriction: number) => {
-    setTxPending(true);
+    beginTx();
     setError(null);
     try {
       if (isDemoMode) {
         await new Promise(r => setTimeout(r, 1500));
-        // In demo mode, update the pot balance locally to reflect the donation.
         setCurrentCharity(prev => {
           if (!prev || prev.info.contractAddress !== contractAddress) return prev;
           const prevPot = prev.state?.potValue ?? 0n;
@@ -431,20 +445,23 @@ export const DonorProofProvider: React.FC<React.PropsWithChildren<{ logger: Logg
             : prev;
         });
       } else {
-        const api = await DonorProofAPI.join(providersRef.current!.providers as any, contractAddress, logger);
+        // Reuse the current charity's API if the address matches to avoid an extra join RPC.
+        const api = currentCharity?.info.contractAddress === contractAddress
+          ? currentCharity.api
+          : await DonorProofAPI.join(providersRef.current!.providers as any, contractAddress, logger);
         await api.donorDeposit(amount, restriction);
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Donation failed');
       throw err;
     } finally {
-      setTxPending(false);
+      endTx();
     }
-  }, [isDemoMode, logger]);
+  }, [isDemoMode, currentCharity, logger]);
 
   const releaseFunds = useCallback(async () => {
     if (!currentCharity) throw new Error('No charity selected');
-    setTxPending(true);
+    beginTx();
     setError(null);
     try {
       if (isDemoMode) {
@@ -459,7 +476,7 @@ export const DonorProofProvider: React.FC<React.PropsWithChildren<{ logger: Logg
       setError(err instanceof Error ? err.message : 'Release failed');
       throw err;
     } finally {
-      setTxPending(false);
+      endTx();
     }
   }, [currentCharity, isDemoMode]);
 

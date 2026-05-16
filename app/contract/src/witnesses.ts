@@ -4,7 +4,6 @@ import { Ledger } from "./managed/donor-proof/contract/index.js";
 export type DonorProofPrivateState = Record<string, never>;
 
 export const initialPrivateState: DonorProofPrivateState = {};
-export const donorProofPrivateStateKey = "donorProofPrivateState";
 
 export type PendingExpense = {
   expenseId: Uint8Array;
@@ -14,8 +13,13 @@ export type PendingExpense = {
   isAdmin: boolean;
 };
 
+// Module-level write-slot. Set immediately before callTx.commitExpense() and
+// cleared in the finally block. Safe only for sequential calls — concurrent
+// commitExpense invocations on the same page would race on this value.
 let _pendingExpense: PendingExpense | null = null;
 
+// Called by DonorProofAPI.commitExpense; witnesses read this synchronously
+// during ZK proof generation. Must be cleared after each call.
 export function setPendingExpense(expense: PendingExpense | null): void {
   _pendingExpense = expense;
 }

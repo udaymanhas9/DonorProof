@@ -32,6 +32,7 @@ export interface DonorProofState {
   readonly potValue: bigint;
 }
 
+// Facade interface consumed by the UI context; hides SDK internals.
 export interface DeployedDonorProofAPI {
   readonly contractAddress: ContractAddress;
   readonly state$: Observable<DonorProofState>;
@@ -41,6 +42,8 @@ export interface DeployedDonorProofAPI {
   releaseFunds: () => Promise<void>;
 }
 
+// Derives computed display fields (pcts) so callers avoid raw bigint arithmetic.
+// Guards against divide-by-zero when no expenses are committed yet.
 function buildState$(
   providers: DonorProofProviders,
   contractAddress: ContractAddress,
@@ -69,6 +72,7 @@ function buildState$(
     );
 }
 
+// Browser-side entry point. Use deploy() or join() — never call constructor directly.
 export class DonorProofAPI implements DeployedDonorProofAPI {
   readonly contractAddress: ContractAddress;
   readonly state$: Observable<DonorProofState>;
@@ -85,6 +89,7 @@ export class DonorProofAPI implements DeployedDonorProofAPI {
 
   async commitExpense(amount: bigint, isDirectAid: boolean, isAdmin: boolean): Promise<void> {
     this.logger?.info({ amount, isDirectAid, isAdmin }, 'commitExpense');
+    // Set the module-global witness slot then clear it in finally — see witnesses.ts.
     setPendingExpense({
       expenseId: newExpenseId(),
       blindingFactor: newBlindingFactor(),
@@ -106,6 +111,8 @@ export class DonorProofAPI implements DeployedDonorProofAPI {
 
   async donorDeposit(amount: bigint, restriction: number): Promise<void> {
     this.logger?.info({ amount, restriction }, 'donorDeposit');
+    // Synthetic coin: nonce is random, color is zero (NIGHT token placeholder).
+    // The wallet's balanceTx handles actual UTXO selection.
     const coin = {
       nonce: crypto.getRandomValues(new Uint8Array(32)),
       color: new Uint8Array(32),
