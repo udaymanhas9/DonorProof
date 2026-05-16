@@ -1,0 +1,1 @@
+A Midnight-based proof layer for charities that need to prove restricted funds were used properly while keeping beneficiary-level data private.
