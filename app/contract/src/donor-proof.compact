@@ -1,0 +1,155 @@
+pragma language_version >= 0.23;
+
+import CompactStandardLibrary;
+
+export sealed ledger campaignOwner: ZswapCoinPublicKey;
+export sealed ledger directAidThreshold: Uint<8>;
+export sealed ledger adminThreshold: Uint<8>;
+
+export ledger totalSpend: Uint<64>;
+export ledger directAidSpend: Uint<64>;
+export ledger adminSpend: Uint<64>;
+
+export ledger expenseChainHash: Bytes<32>;
+export ledger expenseNullifiers: Set<Bytes<32>>;
+export ledger expenseSequence: Counter;
+export ledger isVerified: Boolean;
+
+export ledger pot: QualifiedShieldedCoinInfo;
+export ledger potHasCoin: Boolean;
+export ledger donorTotalDeposits: Map<ZswapCoinPublicKey, Uint<128>>;
+export ledger donorRestrictions: Map<ZswapCoinPublicKey, Uint<8>>;
+
+witness expenseId(): Bytes<32>;
+witness expenseBlind(): Bytes<32>;
+witness expenseAmount(): Uint<64>;
+witness expenseIsDirectAid(): Boolean;
+witness expenseIsAdmin(): Boolean;
+
+circuit assertOnlyOwner(): [] {
+  assert(ownPublicKey() == campaignOwner, "caller is not campaign owner");
+}
+
+constructor(minDirectAid: Uint<8>, maxAdmin: Uint<8>) {
+  campaignOwner = disclose(ownPublicKey());
+  directAidThreshold = disclose(minDirectAid);
+  adminThreshold = disclose(maxAdmin);
+
+  totalSpend = 0;
+  directAidSpend = 0;
+  adminSpend = 0;
+
+  expenseChainHash = pad(32, "donorproof:genesis");
+
+  isVerified = false;
+
+  potHasCoin = false;
+}
+
+export circuit commitExpense(): [] {
+  assertOnlyOwner();
+
+  const id = expenseId();
+  const blind = expenseBlind();
+  const amount = expenseAmount();
+  const isDirectAid = expenseIsDirectAid();
+  const isAdmin = expenseIsAdmin();
+
+  const nullifier = persistentHash<Vector<2, Bytes<32>>>([
+    pad(32, "donorproof:nullifier"),
+    id
+  ]);
+  assert(!expenseNullifiers.member(disclose(nullifier)), "expense already committed");
+  expenseNullifiers.insert(disclose(nullifier));
+
+  assert(!(disclose(isDirectAid) && disclose(isAdmin)),
+         "expense cannot be both direct aid and admin");
+
+  const amountBytes: Bytes<32> = (amount as Field) as Bytes<32>;
+  const isDirectAidBytes: Bytes<32> = (isDirectAid as Field) as Bytes<32>;
+  const isAdminBytes: Bytes<32> = (isAdmin as Field) as Bytes<32>;
+  const commitment = persistentCommit<Vector<4, Bytes<32>>>(
+    [id, amountBytes, isDirectAidBytes, isAdminBytes],
+    blind
+  );
+
+  expenseChainHash = persistentHash<Vector<2, Bytes<32>>>([
+    expenseChainHash,
+    disclose(commitment)
+  ]);
+
+  expenseSequence.increment(1 as Uint<16>);
+
+  const disclosedAmount = disclose(amount);
+  totalSpend = (totalSpend + disclosedAmount) as Uint<64>;
+
+  if (disclose(isDirectAid)) {
+    directAidSpend = (directAidSpend + disclosedAmount) as Uint<64>;
+  }
+
+  if (disclose(isAdmin)) {
+    adminSpend = (adminSpend + disclosedAmount) as Uint<64>;
+  }
+}
+
+export circuit verifyCompliance(): [] {
+  assertOnlyOwner();
+
+  assert(totalSpend > 0, "no expenses committed");
+
+  const directAidScaled: Uint<128> = ((directAidSpend as Field) * (100 as Field)) as Uint<128>;
+  const directAidBound: Uint<128> =
+          ((totalSpend as Field) * (directAidThreshold as Field)) as Uint<128>;
+  assert(directAidScaled >= directAidBound, "direct aid below threshold");
+
+  const adminScaled: Uint<128> = ((adminSpend as Field) * (100 as Field)) as Uint<128>;
+  const adminBound: Uint<128> = ((totalSpend as Field) * (adminThreshold as Field)) as Uint<128>;
+  assert(adminScaled <= adminBound, "admin above threshold");
+
+  isVerified = true;
+}
+
+export circuit donorDeposit(coin: ShieldedCoinInfo, restriction: Uint<8>): [] {
+  assert(restriction <= 3, "restriction must be 0, 1, 2, or 3");
+
+  receiveShielded(disclose(coin));
+
+  if (potHasCoin) {
+    pot.writeCoin(
+      mergeCoinImmediate(pot, disclose(coin)),
+      right<ZswapCoinPublicKey, ContractAddress>(kernel.self())
+    );
+  } else {
+    pot.writeCoin(disclose(coin), right<ZswapCoinPublicKey, ContractAddress>(kernel.self()));
+    potHasCoin = true;
+  }
+
+  const donor = disclose(ownPublicKey());
+
+  donorRestrictions.insert(donor, disclose(restriction));
+
+  const depositValue = disclose(coin.value);
+  const previousTotal =
+          donorTotalDeposits.member(donor) ? donorTotalDeposits.lookup(donor) : 0 as Uint<128>;
+  donorTotalDeposits.insert(donor, (previousTotal + depositValue) as Uint<128>);
+}
+
+export circuit releaseFunds(): [] {
+  assertOnlyOwner();
+  assert(isVerified, "compliance not yet verified");
+  assert(potHasCoin, "no funds to release");
+
+  const releaseAmount = pot.value;
+
+  const result = sendShielded(
+                   pot,
+                   left<ZswapCoinPublicKey, ContractAddress>(campaignOwner),
+                   releaseAmount
+                 );
+
+  if (disclose(result.change.is_some)) {
+    pot.writeCoin(result.change.value, right<ZswapCoinPublicKey, ContractAddress>(kernel.self()));
+  } else {
+    potHasCoin = false;
+  }
+}

@@ -1,0 +1,293 @@
+pragma language_version >= 0.23;
+
+import CompactStandardLibrary;
+
+// ---------------------------------------------------------------------------
+// DonorProof — Privacy-preserving charity compliance.
+//
+// Privacy model:
+//   - Expense amounts are disclosed (visible as per-call deltas on totalSpend).
+//   - Expense IDs and blinding factors are never disclosed; only their hashes
+//     appear on-chain via the commitment and nullifier.
+//   - The category flags (isDirectAid, isAdmin) are disclosed so the running
+//     category totals can be updated publicly.
+//
+// Tamper-evidence model:
+//   - Each commitExpense() call produces an on-chain commitment and extends
+//     expenseChainHash. The chain makes expense history append-only: inserting
+//     a retroactive expense would require changing every subsequent chain hash,
+//     which is immutable on-chain.
+//   - Nullifiers stored in expenseNullifiers prevent the same expense from
+//     being committed twice.
+//   - expenseSequence provides a monotonically increasing ordering anchor.
+//
+// Donation model (Zswap shielded coins):
+//   - donorDeposit() lets any donor lock a shielded NIGHT (or other shielded)
+//     coin into the contract along with a category restriction byte
+//     (0 = unrestricted, 1 = food, 2 = medical, 3 = housing).
+//   - All deposits are merged into a single pooled coin held by the contract
+//     (the "pot"), following the Treasury / Pot pattern.
+//   - Per-donor restriction and cumulative deposited amount are recorded so
+//     verifyCompliance / off-chain auditors can later prove the spend mix
+//     respected donor restrictions.
+//   - releaseFunds() lets the campaignOwner withdraw the full pooled balance
+//     to themselves once isVerified == true.
+//
+// Privacy trade-offs in the donation flow:
+//   - The pot's value (current total holdings) is visible on-chain because
+//     QualifiedShieldedCoinInfo.value is a public field.
+//   - Each donor's ZswapCoinPublicKey (ownPublicKey() at deposit time) is
+//     disclosed so we can record the per-donor restriction. The contract
+//     therefore reveals the *set of donors*, not just their aggregate.
+//   - The restriction byte is a circuit parameter and is public by definition.
+//   - The donated *coin value* is also visible per-deposit because we update
+//     a per-donor cumulative total. This matches the existing aggregation-
+//     leak in commitExpense(); the contract does not aim to hide amounts.
+// ---------------------------------------------------------------------------
+
+// --- Public ledger state ----------------------------------------------------
+
+// Sealed: written once in the constructor, immutable thereafter.
+export sealed ledger campaignOwner: ZswapCoinPublicKey;
+
+export sealed ledger directAidThreshold: Uint<8>;
+
+export sealed ledger adminThreshold: Uint<8>;
+
+// Running totals — updated on each commitExpense().
+export ledger totalSpend: Uint<64>;
+
+export ledger directAidSpend: Uint<64>;
+
+export ledger adminSpend: Uint<64>;
+
+// Commitment chain — extends with each expense; proves append-only history.
+export ledger expenseChainHash: Bytes<32>;
+
+// Nullifier set — prevents double-submission of the same expense.
+export ledger expenseNullifiers: Set<Bytes<32>>;
+
+// Monotonically increasing counter — ordering proof.
+export ledger expenseSequence: Counter;
+
+// Compliance proof flag — set by verifyCompliance().
+export ledger isVerified: Boolean;
+
+// --- Donation pot (Zswap shielded coin pool) --------------------------------
+
+// The accumulated shielded coin held by the contract on behalf of all donors.
+// First deposit initialises it via writeCoin; subsequent deposits merge into
+// it via mergeCoinImmediate. The Boolean flag tracks whether the pot has been
+// initialised yet (a default QualifiedShieldedCoinInfo has all-zero fields
+// which is not the same as "no coin held").
+export ledger pot: QualifiedShieldedCoinInfo;
+
+export ledger potHasCoin: Boolean;
+
+// Per-donor cumulative shielded deposits (in coin atomic units).
+// Key:   donor's ZswapCoinPublicKey at deposit time.
+// Value: sum of donated coin values across all of this donor's deposits.
+export ledger donorTotalDeposits: Map<ZswapCoinPublicKey, Uint<128>>;
+
+// Per-donor restriction byte (0 = unrestricted, 1 = food, 2 = medical,
+// 3 = housing). A donor that calls donorDeposit() more than once with
+// different restrictions will have the most recent value retained;
+// changing restriction mid-campaign is a deliberate UX choice that we
+// surface to off-chain auditors via the donor's update history.
+export ledger donorRestrictions: Map<ZswapCoinPublicKey, Uint<8>>;
+
+// --- Witnesses --------------------------------------------------------------
+
+// Expense identity and blinding — private, never disclosed.
+witness expenseId(): Bytes<32>;
+
+witness expenseBlind(): Bytes<32>;
+
+// Expense details — amount disclosed to update totals; categories disclosed
+// to update category buckets. IDs and blinding remain private.
+witness expenseAmount(): Uint<64>;
+
+witness expenseIsDirectAid(): Boolean;
+
+witness expenseIsAdmin(): Boolean;
+
+// --- Internal circuits ------------------------------------------------------
+
+circuit assertOnlyOwner(): [] {
+  assert(ownPublicKey() == campaignOwner, "caller is not campaign owner");
+}
+
+// --- Constructor ------------------------------------------------------------
+
+constructor(minDirectAid: Uint<8>, maxAdmin: Uint<8>) {
+  campaignOwner = disclose(ownPublicKey());
+  directAidThreshold = disclose(minDirectAid);
+  adminThreshold = disclose(maxAdmin);
+
+  totalSpend = 0;
+  directAidSpend = 0;
+  adminSpend = 0;
+
+  expenseChainHash = pad(32, "donorproof:genesis");
+
+  isVerified = false;
+
+  potHasCoin = false;
+}
+
+// --- Circuits ---------------------------------------------------------------
+
+export circuit commitExpense(): [] {
+  assertOnlyOwner();
+
+  const id = expenseId();
+  const blind = expenseBlind();
+  const amount = expenseAmount();
+  const isDirectAid = expenseIsDirectAid();
+  const isAdmin = expenseIsAdmin();
+
+  // 1. Nullifier — prevents the same expense from being committed twice.
+  //    The nullifier is the hash of a domain prefix and the expense ID.
+  //    Disclosing it makes the used-nullifier set publicly auditable.
+  const nullifier = persistentHash<Vector<2, Bytes<32>>>([pad(32, "donorproof:nullifier"), id]);
+  assert(!expenseNullifiers.member(disclose(nullifier)), "expense already committed");
+  expenseNullifiers.insert(disclose(nullifier));
+
+  // 2. Category mutual exclusion.
+  assert(!(disclose(isDirectAid) && disclose(isAdmin)),
+         "expense cannot be both direct aid and admin"
+         );
+
+  // 3. Commitment — binds private expense details to an on-chain Bytes<32>.
+  //    The commitment output is safe to disclose: it reveals nothing about
+  //    id, amount, or category beyond what is already public via the totals.
+  //    Disclosing it makes each expense's commitment publicly auditable.
+  const amountBytes: Bytes<32> = (amount as Field) as Bytes<32>;
+  const isDirectAidBytes: Bytes<32> = (isDirectAid as Field) as Bytes<32>;
+  const isAdminBytes: Bytes<32> = (isAdmin as Field) as Bytes<32>;
+  const commitment =
+          persistentCommit<Vector<4, Bytes<32>>>(
+            [id, amountBytes, isDirectAidBytes, isAdminBytes],
+            blind
+            );
+
+  // 4. Extend the chain hash — makes expense history append-only.
+  expenseChainHash = persistentHash<Vector<2, Bytes<32>>>([expenseChainHash, disclose(commitment)]);
+
+  // 5. Increment sequence counter — ordering proof.
+  expenseSequence.increment(1 as Uint<16>);
+
+  // 6. Update running totals.
+  //    Amount is disclosed so it can update the public total.
+  //    Individual per-call deltas are visible on-chain (aggregation-leak).
+  const disclosedAmount = disclose(amount);
+  totalSpend = (totalSpend + disclosedAmount) as Uint<64>;
+
+  if (disclose(isDirectAid)) {
+    directAidSpend = (directAidSpend + disclosedAmount) as Uint<64>;
+  }
+
+  if (disclose(isAdmin)) {
+    adminSpend = (adminSpend + disclosedAmount) as Uint<64>;
+  }
+}
+
+// Aggregate compliance check. Only callable by the campaign owner.
+// Cross-multiplied integer comparisons avoid division (Compact has no division).
+export circuit verifyCompliance(): [] {
+  assertOnlyOwner();
+
+  assert(totalSpend > 0, "no expenses committed");
+
+  // directAidSpend / totalSpend >= directAidThreshold / 100
+  //   <=> directAidSpend * 100 >= totalSpend * directAidThreshold
+  const directAidScaled: Uint<128> = ((directAidSpend as Field) * (100 as Field)) as Uint<128>;
+  const directAidBound: Uint<128> =
+          ((totalSpend as Field) * (directAidThreshold as Field)) as Uint<128>;
+  assert(directAidScaled >= directAidBound, "direct aid below threshold");
+
+  // adminSpend / totalSpend <= adminThreshold / 100
+  //   <=> adminSpend * 100 <= totalSpend * adminThreshold
+  const adminScaled: Uint<128> = ((adminSpend as Field) * (100 as Field)) as Uint<128>;
+  const adminBound: Uint<128> = ((totalSpend as Field) * (adminThreshold as Field)) as Uint<128>;
+  assert(adminScaled <= adminBound, "admin above threshold");
+
+  isVerified = true;
+}
+
+// --- Donation circuits ------------------------------------------------------
+
+// Donor locks a shielded coin into the contract's pot and registers a
+// category restriction. The coin parameter is the shielded coin the donor
+// is parting with; the wallet supplies it as a circuit argument that is
+// disclosed (its value and color become publicly visible on-chain, but the
+// nonce and spend authorization remain bound to the Zswap protocol).
+//
+// restriction values:
+//   0 = unrestricted (campaign owner may spend on any category)
+//   1 = food
+//   2 = medical
+//   3 = housing
+export circuit donorDeposit(coin: ShieldedCoinInfo, restriction: Uint<8>): [] {
+  // Restriction must be one of the four allowed values.
+  assert(restriction <= 3, "restriction must be 0, 1, 2, or 3");
+
+  // 1. Accept the coin into the contract's Zswap context.
+  receiveShielded(disclose(coin));
+
+  // 2. Merge into the pot. First deposit initialises the pot; subsequent
+  //    deposits combine the new coin with the existing pot in the same
+  //    transaction via mergeCoinImmediate.
+  if (potHasCoin) {
+    pot.writeCoin(
+      mergeCoinImmediate(pot, disclose(coin)),
+      right<ZswapCoinPublicKey, ContractAddress>(kernel.self())
+      );
+  } else {
+    pot.writeCoin(disclose(coin), right<ZswapCoinPublicKey, ContractAddress>(kernel.self()));
+    potHasCoin = true;
+  }
+
+  // 3. Record the donor's restriction and cumulative deposit.
+  //    ownPublicKey() is the donor's Zswap public key; disclosing it lets
+  //    auditors verify that the campaign owner honoured each donor's
+  //    chosen restriction. If you need anonymous donations, replace this
+  //    Map with a MerkleTree of restriction commitments instead.
+  const donor = disclose(ownPublicKey());
+
+  donorRestrictions.insert(donor, disclose(restriction));
+
+  const depositValue = disclose(coin.value);
+  const previousTotal =
+          donorTotalDeposits.member(donor) ? donorTotalDeposits.lookup(donor) : 0 as Uint<128>;
+  donorTotalDeposits.insert(donor, (previousTotal + depositValue) as Uint<128>);
+}
+
+// Campaign owner pulls the entire pooled balance out to themselves once
+// compliance has been verified. We always release the full pot; partial
+// withdrawals are a possible future feature but are deliberately out of
+// scope here so the donor invariant ("locked funds stay locked until
+// verifyCompliance succeeds") is easy to state.
+export circuit releaseFunds(): [] {
+  assertOnlyOwner();
+  assert(isVerified, "compliance not yet verified");
+  assert(potHasCoin, "no funds to release");
+
+  // Snapshot the pot value (sendShielded consumes the qualified coin).
+  const releaseAmount = pot.value;
+
+  const result = sendShielded(
+                   pot,
+                   left<ZswapCoinPublicKey, ContractAddress>(campaignOwner),
+                   releaseAmount
+                   );
+
+  // releaseAmount == pot.value, so there should be no change. Handle it
+  // defensively anyway: if the protocol ever produces a non-empty change
+  // coin, write it back so funds are not lost.
+  if (disclose(result.change.is_some)) {
+    pot.writeCoin(result.change.value, right<ZswapCoinPublicKey, ContractAddress>(kernel.self()));
+  } else {
+    potHasCoin = false;
+  }
+}
