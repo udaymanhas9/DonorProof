@@ -203,6 +203,7 @@ export const DonorProofProvider: React.FC<React.PropsWithChildren<{ logger: Logg
 
   const providersRef = useRef<Awaited<ReturnType<typeof buildProviders>> | null>(null);
   const mockStateRef = useRef<DonorProofState | null>(null);
+  const demoSubjectRef = useRef<BehaviorSubject<DonorProofState> | null>(null);
   const expenseCountRef = useRef(0);
   // Counter so concurrent operations don't prematurely clear the pending flag.
   const pendingCountRef = useRef(0);
@@ -234,14 +235,31 @@ export const DonorProofProvider: React.FC<React.PropsWithChildren<{ logger: Logg
     setCurrentCharity(null);
   }, []);
 
+  // Applies an updater to the demo charity's state, keeping the shared BehaviorSubject
+  // and React state in sync so CampaignPage subscribers see the same live updates.
+  const updateDemoState = useCallback((
+    updater: (prevState: DonorProofState) => DonorProofState,
+    addressFilter?: string,
+  ) => {
+    setCurrentCharity(prev => {
+      if (!prev?.state) return prev;
+      if (addressFilter && prev.info.contractAddress !== addressFilter) return prev;
+      const newState = updater(prev.state);
+      demoSubjectRef.current?.next(newState);
+      return { ...prev, state: newState };
+    });
+  }, []);
+
   const connectAsCharity = useCallback(() => {
     const demoCharity = MOCK_CHARITIES.find(c => c.contractAddress === DEMO_CHARITY_CONTRACT)!;
     mockStateRef.current = { ...demoCharity.state };
 
-    // No-op API: demo state is managed directly via setCurrentCharity in each action.
+    const subject = new BehaviorSubject<DonorProofState>(mockStateRef.current);
+    demoSubjectRef.current = subject;
+
     const mockApi: DeployedDonorProofAPI = {
       contractAddress: demoCharity.contractAddress,
-      state$: new BehaviorSubject<DonorProofState>(mockStateRef.current).asObservable(),
+      state$: subject.asObservable(),
       commitExpense: async () => {},
       verifyCompliance: async () => {},
       donorDeposit: async () => {},
@@ -334,6 +352,18 @@ export const DonorProofProvider: React.FC<React.PropsWithChildren<{ logger: Logg
 
   const joinCharity = useCallback(async (address: string): Promise<DeployedDonorProofAPI> => {
     if (address.startsWith('mock:')) {
+      // Return the shared live subject for the demo charity so CampaignPage
+      // receives the same state stream that mutations update via updateDemoState.
+      if (address === DEMO_CHARITY_CONTRACT && demoSubjectRef.current) {
+        return {
+          contractAddress: address,
+          state$: demoSubjectRef.current.asObservable(),
+          commitExpense: async () => {},
+          verifyCompliance: async () => {},
+          donorDeposit: async () => {},
+          releaseFunds: async () => {},
+        };
+      }
       const mock = MOCK_CHARITIES.find(c => c.contractAddress === address);
       if (!mock) throw new Error('Mock charity not found');
       const subject = new BehaviorSubject<DonorProofState>(mock.state);
@@ -369,23 +399,18 @@ export const DonorProofProvider: React.FC<React.PropsWithChildren<{ logger: Logg
           commitmentHash: fakeCommitmentHash(amount, category, idx),
         };
         setExpenseLog(prev => [record, ...prev]);
-        setCurrentCharity(prev => {
-          if (!prev?.state) return prev;
-          const s = prev.state;
+        updateDemoState(s => {
           const newTotal = s.totalSpend + amount;
           const newDirect = s.directAidSpend + (isDirectAid ? amount : 0n);
           const newAdmin = s.adminSpend + (isAdmin ? amount : 0n);
           return {
-            ...prev,
-            state: {
-              ...s,
-              totalSpend: newTotal,
-              directAidSpend: newDirect,
-              adminSpend: newAdmin,
-              expenseSequence: s.expenseSequence + 1,
-              directAidPct: newTotal > 0n ? Number((newDirect * 100n) / newTotal) : 0,
-              adminPct: newTotal > 0n ? Number((newAdmin * 100n) / newTotal) : 0,
-            },
+            ...s,
+            totalSpend: newTotal,
+            directAidSpend: newDirect,
+            adminSpend: newAdmin,
+            expenseSequence: s.expenseSequence + 1,
+            directAidPct: newTotal > 0n ? Number((newDirect * 100n) / newTotal) : 0,
+            adminPct: newTotal > 0n ? Number((newAdmin * 100n) / newTotal) : 0,
           };
         });
       } else {
@@ -407,19 +432,21 @@ export const DonorProofProvider: React.FC<React.PropsWithChildren<{ logger: Logg
       if (isDemoMode) {
         await new Promise(r => setTimeout(r, 4000));
         const state = currentCharity.state;
-        if (state) {
-          setProofRecord({
-            timestamp: new Date().toLocaleString(),
-            directAidPct: state.directAidPct,
-            adminPct: state.adminPct,
-            expenseSequence: state.expenseSequence,
-            txHash: fakeTxHash(),
-          });
-        }
-        setCurrentCharity(prev => {
-          if (!prev?.state) return prev;
-          return { ...prev, state: { ...prev.state, isVerified: true } };
+        if (!state || state.totalSpend === 0n) throw new Error('No expenses committed');
+        const directAidScaled = state.directAidSpend * 100n;
+        const directAidBound = state.totalSpend * BigInt(state.directAidThreshold);
+        if (directAidScaled < directAidBound) throw new Error('Direct aid below threshold');
+        const adminScaled = state.adminSpend * 100n;
+        const adminBound = state.totalSpend * BigInt(state.adminThreshold);
+        if (adminScaled > adminBound) throw new Error('Admin above threshold');
+        setProofRecord({
+          timestamp: new Date().toLocaleString(),
+          directAidPct: state.directAidPct,
+          adminPct: state.adminPct,
+          expenseSequence: state.expenseSequence,
+          txHash: fakeTxHash(),
         });
+        updateDemoState(s => ({ ...s, isVerified: true }));
       } else {
         await currentCharity.api.verifyCompliance();
       }
@@ -437,13 +464,7 @@ export const DonorProofProvider: React.FC<React.PropsWithChildren<{ logger: Logg
     try {
       if (isDemoMode) {
         await new Promise(r => setTimeout(r, 1500));
-        setCurrentCharity(prev => {
-          if (!prev || prev.info.contractAddress !== contractAddress) return prev;
-          const prevPot = prev.state?.potValue ?? 0n;
-          return prev.state
-            ? { ...prev, state: { ...prev.state, potHasCoin: true, potValue: prevPot + amount } }
-            : prev;
-        });
+        updateDemoState(s => ({ ...s, potHasCoin: true, potValue: (s.potValue ?? 0n) + amount }), contractAddress);
       } else {
         // Reuse the current charity's API if the address matches to avoid an extra join RPC.
         const api = currentCharity?.info.contractAddress === contractAddress
@@ -466,9 +487,7 @@ export const DonorProofProvider: React.FC<React.PropsWithChildren<{ logger: Logg
     try {
       if (isDemoMode) {
         await new Promise(r => setTimeout(r, 2000));
-        setCurrentCharity(prev =>
-          prev?.state ? { ...prev, state: { ...prev.state, potHasCoin: false, potValue: 0n } } : prev,
-        );
+        updateDemoState(s => ({ ...s, potHasCoin: false, potValue: 0n }));
       } else {
         await currentCharity.api.releaseFunds();
       }

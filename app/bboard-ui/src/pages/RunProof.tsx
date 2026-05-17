@@ -51,9 +51,10 @@ const RunProof: React.FC = () => {
 
   const directAidPasses = state.directAidPct >= state.directAidThreshold;
   const adminPasses = state.adminPct <= state.adminThreshold;
-  const canProve = directAidPasses && adminPasses && state.totalSpend > 0n && !state.isVerified;
+  const canProve = directAidPasses && adminPasses && state.totalSpend > 0n;
 
   const handleProve = async () => {
+    setDone(false);
     try {
       await verifyCompliance();
       setDone(true);
@@ -71,69 +72,72 @@ const RunProof: React.FC = () => {
           Preview the result before spending DUST on proof generation.
         </Typography>
 
-        {done || state.isVerified ? (
-          <Card sx={{ bgcolor: '#D1FAE5', border: '1px solid #6EE7B7' }}>
-            <CardContent sx={{ p: 4, textAlign: 'center' }}>
-              <CheckCircleIcon sx={{ fontSize: 48, color: '#10B981', mb: 2 }} />
-              <Typography variant="h4" sx={{ mb: 1 }}>Campaign verified</Typography>
-              <Typography variant="body2" sx={{ color: '#065F46' }}>
-                The ZK proof is on-chain. Donors can verify compliance on your campaign page.
-              </Typography>
-              <Button
-                variant="contained"
-                sx={{ bgcolor: '#1B4332', mt: 3 }}
-                onClick={() => navigate(`/charity/${currentCharity.info.contractAddress}`)}
-              >
-                View public campaign page
-              </Button>
-            </CardContent>
-          </Card>
-        ) : (
-          <Card>
-            <CardContent sx={{ p: 3 }}>
-              <Typography variant="h6" sx={{ mb: 2 }}>Current snapshot</Typography>
-
-              {state.totalSpend === 0n ? (
-                <Alert severity="warning" sx={{ borderRadius: 2, mb: 2 }}>
-                  No expenses committed yet. Log expenses before running a proof.
-                </Alert>
-              ) : (
-                <>
-                  <ThresholdRow label="Direct aid spend" value={state.directAidPct} threshold={state.directAidThreshold} operator=">=" />
-                  <ThresholdRow label="Admin spend" value={state.adminPct} threshold={state.adminThreshold} operator="<=" />
-                </>
-              )}
-
-              <Divider sx={{ my: 3 }} />
-
-              <Box sx={{ bgcolor: '#F9FAFB', borderRadius: 2, p: 2, mb: 3 }}>
-                <Typography variant="caption" sx={{ color: '#6B7280', lineHeight: 1.7, display: 'block' }}>
-                  Estimated cost: ~0.008 DUST · Proof generation takes 20–60 seconds · Result is permanent on-chain
+        {done && (
+          <Card sx={{ bgcolor: '#D1FAE5', border: '1px solid #6EE7B7', mb: 3 }}>
+            <CardContent sx={{ p: 3, display: 'flex', alignItems: 'center', gap: 2 }}>
+              <CheckCircleIcon sx={{ fontSize: 32, color: '#10B981', flexShrink: 0 }} />
+              <Box sx={{ flex: 1 }}>
+                <Typography variant="h6" sx={{ mb: 0.5 }}>Campaign verified</Typography>
+                <Typography variant="body2" sx={{ color: '#065F46' }}>
+                  ZK proof on-chain. Donors can verify compliance on your campaign page.
                 </Typography>
               </Box>
-
-              {!canProve && state.totalSpend > 0n && (
-                <Alert severity="error" sx={{ borderRadius: 2, mb: 2 }}>
-                  Thresholds not met. Log more compliant expenses before generating the proof — a failing proof still costs DUST.
-                </Alert>
-              )}
-
-              {error && <Alert severity="error" sx={{ borderRadius: 2, mb: 2 }}>{error}</Alert>}
-
               <Button
-                variant="contained"
-                fullWidth
-                size="large"
-                sx={{ bgcolor: '#1B4332' }}
-                disabled={!canProve || txPending}
-                onClick={handleProve}
-                startIcon={txPending ? <CircularProgress size={18} sx={{ color: '#fff' }} /> : null}
+                variant="outlined"
+                size="small"
+                sx={{ borderColor: '#1B4332', color: '#1B4332', flexShrink: 0 }}
+                onClick={() => navigate(`/charity/${currentCharity.info.contractAddress}`)}
               >
-                {txPending ? 'Generating proof…' : 'Generate & submit proof →'}
+                View page
               </Button>
             </CardContent>
           </Card>
         )}
+
+        <Card>
+          <CardContent sx={{ p: 3 }}>
+            <Typography variant="h6" sx={{ mb: 2 }}>Current snapshot</Typography>
+
+            {state.totalSpend === 0n ? (
+              <Alert severity="warning" sx={{ borderRadius: 2, mb: 2 }}>
+                No expenses committed yet. Log expenses before running a proof.
+              </Alert>
+            ) : (
+              <>
+                <ThresholdRow label="Direct aid spend" value={state.directAidPct} threshold={state.directAidThreshold} operator=">=" />
+                <ThresholdRow label="Admin spend" value={state.adminPct} threshold={state.adminThreshold} operator="<=" />
+              </>
+            )}
+
+            <Divider sx={{ my: 3 }} />
+
+            <Box sx={{ bgcolor: '#F9FAFB', borderRadius: 2, p: 2, mb: 3 }}>
+              <Typography variant="caption" sx={{ color: '#6B7280', lineHeight: 1.7, display: 'block' }}>
+                Estimated cost: ~0.008 DUST · Proof generation takes 20–60 seconds · Result is permanent on-chain
+              </Typography>
+            </Box>
+
+            {!canProve && state.totalSpend > 0n && (
+              <Alert severity="error" sx={{ borderRadius: 2, mb: 2 }}>
+                Thresholds not met. Log more compliant expenses before generating the proof — a failing proof still costs DUST.
+              </Alert>
+            )}
+
+            {error && <Alert severity="error" sx={{ borderRadius: 2, mb: 2 }}>{error}</Alert>}
+
+            <Button
+              variant="contained"
+              fullWidth
+              size="large"
+              sx={{ bgcolor: '#1B4332' }}
+              disabled={!canProve || txPending}
+              onClick={handleProve}
+              startIcon={txPending ? <CircularProgress size={18} sx={{ color: '#fff' }} /> : null}
+            >
+              {txPending ? 'Generating proof…' : state.isVerified ? 'Re-generate proof →' : 'Generate & submit proof →'}
+            </Button>
+          </CardContent>
+        </Card>
       </Container>
     </Box>
   );

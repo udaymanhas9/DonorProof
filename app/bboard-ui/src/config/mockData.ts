@@ -17,7 +17,7 @@ export const MOCK_CHARITIES: MockCharity[] = [
       directAidSpend: 41000n,
       adminSpend: 2500n,
       expenseSequence: 23,
-      isVerified: true,
+      isVerified: false,
       directAidPct: 91,
       adminPct: 6,
       potHasCoin: true,
